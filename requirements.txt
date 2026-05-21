@@ -1,0 +1,2 @@
+latent-riemannian-world>=0.2.0
+torch>=2.4

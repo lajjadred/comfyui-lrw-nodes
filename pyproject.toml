@@ -1,0 +1,13 @@
+[project]
+name = "comfyui-lrw-nodes"
+version = "0.1.0"
+description = "ComfyUI custom nodes for Riemannian geometry and Bayesian latent space manipulation"
+readme = "README.md"
+license = { text = "BSL-1.1" }
+requires-python = ">=3.12"
+authors = [{ name = "lajjadred" }]
+keywords = ["comfyui", "riemannian-geometry", "latent-space", "diffusion-models"]
+
+[project.urls]
+Homepage = "https://github.com/lajjadred/comfyui-lrw-nodes"
+Repository = "https://github.com/lajjadred/comfyui-lrw-nodes"
