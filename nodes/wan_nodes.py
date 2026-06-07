@@ -1,99 +1,196 @@
 """
-ComfyUI nodes for WAN2.2 video generation with Riemannian geometry.
+ComfyUI nodes for WAN2.2 video generation with LRW-compatible latent geodesic keyframes.
 
-Key fixes:
-1. WAN VAE handles 5D tensors (B, C, T, H, W) — time axis included
-2. Proper VRAM management: chunked Jacobian + torch.cuda.empty_cache()
-3. fp16/fp8 auto-casting based on available VRAM
-4. Chunked geodesic computation to fit 12-16GB VRAM
+v8_wan5d_default — RAM/VRAM-safe revision with LRW-first backend
+
+Main goals:
+1. Keep the geodesic/keyframe feature visible in WAN workflows.
+2. Avoid PullbackMetric, jacrev, vmap, and WAN VAE decoding inside metric computation.
+3. Avoid constructing any D x D metric tensor such as torch.eye(D).
+4. Keep compatibility with the lrw package by importing/initializing GeodesicSolver when available,
+   while using lrw.geodesic.GeodesicSolver.interpolate() first when available, then falling back to a guaranteed memory-safe streaming SLERP implementation only if LRW fails.
+
+Important note:
+This is not a WAN VAE pullback-metric geodesic.
+It is a norm-preserving latent-space spherical geodesic approximation.
+That is the practical safe route for ComfyUI + WAN VAE because WAN VAE decode is not vmap-safe.
 """
 
 from __future__ import annotations
 
 import gc
+import math
+from typing import Any, Dict, Optional, Tuple
+
 import torch
 from torch import Tensor
 
 
 # ─────────────────────────────────────────────
-# VRAM utilities
+# Memory utilities
 # ─────────────────────────────────────────────
 
 def _get_free_vram_gb() -> float:
     if not torch.cuda.is_available():
         return 0.0
-    free, total = torch.cuda.mem_get_info()
+    free, _total = torch.cuda.mem_get_info()
     return free / 1e9
 
 
-def _auto_dtype() -> torch.dtype:
-    """Pick fp16 or fp32 based on free VRAM."""
-    free = _get_free_vram_gb()
-    return torch.float16 if free < 10.0 else torch.float32
-
-
-def _clear_vram():
+def _clear_memory() -> None:
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
 
 
-def _safe_dtype(precision: str) -> torch.dtype:
-    dtype_map = {
-        "fp32": torch.float32,
-        "fp16": torch.float16,
-    }
-    # fp8 requires torch 2.4+ and CUDA; fallback to fp16
-    if precision == "fp8":
-        try:
-            return torch.float8_e4m3fn
-        except AttributeError:
-            return torch.float16
-    return dtype_map.get(precision, torch.float16)
+def _resolve_chunk(vram_mode: str, batch_size: int) -> int:
+    """
+    Conservative chunk resolver.
+
+    The safest value is 1. We keep larger chunks only when there is enough free VRAM.
+    This prevents sudden memory spikes during keyframe construction.
+    """
+    if batch_size <= 1:
+        return 1
+
+    if vram_mode == "low_12gb":
+        return 1
+    if vram_mode == "mid_16gb":
+        return min(2, batch_size)
+    if vram_mode == "high_24gb":
+        return min(4, batch_size)
+
+    free = _get_free_vram_gb()
+    if free < 6:
+        return 1
+    if free < 12:
+        return min(2, batch_size)
+    return min(4, batch_size)
+
+
+def _extract_spatial_latent(z: Tensor) -> Tuple[Tensor, Tuple[int, ...], str]:
+    """
+    Accepts:
+    - image latent: (B, C, H, W)
+    - video latent: (B, C, T, H, W)
+
+    For metric/keyframe generation, a single spatial frame is used when a video latent is passed.
+    """
+    if z.ndim == 4:
+        return z, tuple(z.shape[1:]), "4D"
+    if z.ndim == 5:
+        # Use the first temporal slice only to avoid multiplying memory by T.
+        z_first = z[:, :, 0, :, :]
+        return z_first, tuple(z_first.shape[1:]), "5D_first_frame"
+    raise ValueError(f"Unexpected latent shape: {tuple(z.shape)}. Expected 4D or 5D latent.")
+
+
+def _safe_slerp_pair(z0: Tensor, z1: Tensor, t_values: Tensor, eps: float = 1e-7) -> Tensor:
+    """
+    Memory-safe SLERP for one chunk.
+
+    z0: (B, D)
+    z1: (B, D)
+    t_values: (K,)
+    returns: (K, B, D)
+
+    This function is O(K*B*D), never O(D^2).
+    It does not build any metric tensor.
+    """
+    # Keep calculation in float32 for numerical stability, then caller can cast back.
+    z0 = z0.float()
+    z1 = z1.float()
+
+    norm0 = z0.norm(dim=-1, keepdim=True).clamp_min(eps)
+    norm1 = z1.norm(dim=-1, keepdim=True).clamp_min(eps)
+
+    u0 = z0 / norm0
+    u1 = z1 / norm1
+
+    dot = (u0 * u1).sum(dim=-1, keepdim=True).clamp(-1.0 + eps, 1.0 - eps)
+    omega = torch.acos(dot)
+    sin_omega = torch.sin(omega).clamp_min(eps)
+
+    # Interpolate direction on the sphere.
+    # Shape broadcasting:
+    # t: (K,1,1), u0/u1: (1,B,D), omega: (1,B,1)
+    t = t_values.to(device=z0.device, dtype=z0.dtype).view(-1, 1, 1)
+    u0_b = u0.unsqueeze(0)
+    u1_b = u1.unsqueeze(0)
+    omega_b = omega.unsqueeze(0)
+    sin_omega_b = sin_omega.unsqueeze(0)
+
+    dir_path = (
+        torch.sin((1.0 - t) * omega_b) / sin_omega_b * u0_b
+        + torch.sin(t * omega_b) / sin_omega_b * u1_b
+    )
+
+    # Interpolate norm linearly. This avoids a hard assumption that both endpoint norms match.
+    norm_path = (1.0 - t) * norm0.unsqueeze(0) + t * norm1.unsqueeze(0)
+
+    # If endpoints are nearly parallel, SLERP becomes numerically equivalent to LERP.
+    # Replace those rows with normalized LERP to prevent instability.
+    near_parallel = (omega < 1e-4).view(1, -1, 1)
+    lerp_path = (1.0 - t) * z0.unsqueeze(0) + t * z1.unsqueeze(0)
+
+    return torch.where(near_parallel, lerp_path, dir_path * norm_path)
+
+
+def _latent_lerp_pair(z0: Tensor, z1: Tensor, t_values: Tensor) -> Tensor:
+    """Simple LERP path for comparison/debug mode."""
+    t = t_values.to(device=z0.device, dtype=torch.float32).view(-1, 1, 1)
+    return (1.0 - t) * z0.float().unsqueeze(0) + t * z1.float().unsqueeze(0)
 
 
 # ─────────────────────────────────────────────
-# WAN VAE decoder bridge
+# LRW-compatible metric object, but no D x D tensor
 # ─────────────────────────────────────────────
 
-def _make_wan_decoder(vae, spatial_shape: tuple, dtype: torch.dtype):
+class _SafeLatentMetric:
     """
-    Build a decoder function compatible with lrw.metric.PullbackMetric.
+    LRW-compatible lightweight metric descriptor.
 
-    WAN VAE expects (B, C, H, W) per-frame input for decoding.
-    We flatten (C, H, W) -> D for metric computation, then reshape back.
+    Deliberately does not construct G(z) as a dense D x D matrix.
+    That is the critical RAM/VRAM safety fix.
 
-    Parameters
-    ----------
-    vae : ComfyUI VAE object
-    spatial_shape : tuple (C, H, W)
-    dtype : torch.dtype for computation
+    Some lrw APIs may ask for metric_tensor(). If that happens, we fail loudly
+    instead of allocating a huge identity matrix and killing the process.
     """
-    C, H, W = spatial_shape
 
-    def decoder(z_flat: Tensor) -> Tensor:
-        """
-        z_flat: (B, D) where D = C*H*W
-        returns: (B, M) flattened decoded pixels
-        """
-        B = z_flat.shape[0]
+    def __init__(self, D: int, regularization: float = 1e-5):
+        self.D = int(D)
+        self.regularization = float(regularization)
+        self.kind = "latent_spherical_safe_no_dense_metric"
 
-        # Reshape to (B, C, H, W)
-        z_spatial = z_flat.reshape(B, C, H, W).to(torch.float32)
+    def metric_tensor(self, z: Tensor) -> Tensor:
+        raise RuntimeError(
+            "Dense metric_tensor() is disabled in v7_safe because it would allocate "
+            f"a D x D matrix with D={self.D}. Use safe_slerp backend instead."
+        )
 
-        with torch.no_grad():
-            decoded = vae.decode(z_spatial)   # (B, 3, H*8, W*8)
+    def geodesic_acceleration(self, z: Tensor, v: Tensor) -> Tensor:
+        return torch.zeros_like(v)
 
-        # Flatten and cast back
-        result = decoded.reshape(B, -1).to(dtype)
+    def local_volume_element(self, z: Tensor) -> Tensor:
+        return torch.ones(z.shape[0], device=z.device, dtype=z.dtype)
 
-        # Free intermediate tensors
-        del decoded
-        _clear_vram()
 
-        return result
+def _try_init_lrw_solver(metric: _SafeLatentMetric, n_steps: int, step_size: float) -> Tuple[Optional[Any], str]:
+    """
+    Tries to initialize lrw.geodesic.GeodesicSolver.
 
-    return decoder
+    We do this to keep the node compatible with the lrw package without relying on
+    memory-dangerous PullbackMetric/Jacobian/VAE paths.
+
+    The default computation still uses safe_slerp because it is guaranteed O(D), not O(D^2).
+    """
+    try:
+        from lrw.geodesic import GeodesicSolver
+        solver = GeodesicSolver(metric=metric, n_steps=n_steps, step_size=step_size)
+        return solver, "lrw.geodesic.GeodesicSolver initialized"
+    except Exception as exc:
+        return None, f"lrw solver unavailable: {type(exc).__name__}: {exc}"
 
 
 # ─────────────────────────────────────────────
@@ -102,21 +199,15 @@ def _make_wan_decoder(vae, spatial_shape: tuple, dtype: torch.dtype):
 
 class LRW_WanTemporalMetric:
     """
-    Computes the Riemannian metric for WAN2.2 latent space.
+    Creates a lightweight LRW-compatible metric descriptor for WAN latent space.
 
-    Properly handles WAN's per-frame latent format and manages VRAM
-    through chunked Jacobian computation.
+    This node intentionally avoids:
+    - WAN VAE decode
+    - PullbackMetric
+    - jacrev/vmap
+    - dense D x D metric tensors
 
-    VRAM guide:
-        12GB → precision=fp16, chunk_frames=1
-        16GB → precision=fp16, chunk_frames=2
-        24GB → precision=fp32, chunk_frames=4
-
-    Connect BEFORE LRW_WanGeodesicKeyframes.
-
-    Pipeline:
-        VAELoader ──> LRW_WanTemporalMetric ──> LRW_WanGeodesicKeyframes
-        VAEEncode ──/
+    The output is consumed by LRW_WanGeodesicKeyframes.
     """
 
     @classmethod
@@ -131,16 +222,14 @@ class LRW_WanTemporalMetric:
                     "max": 0.1,
                     "step": 1e-6,
                 }),
-                "precision": (["fp16", "fp32", "fp8"], {
+                "precision": (["fp16", "fp32", "bf16"], {
                     "default": "fp16",
-                    "tooltip": "fp16 for 12-16GB, fp32 for 24GB+, fp8 experimental",
                 }),
                 "chunk_frames": ("INT", {
                     "default": 1,
                     "min": 1,
                     "max": 8,
                     "step": 1,
-                    "tooltip": "Jacobian chunk size. 1 for 12GB, 2 for 16GB, 4 for 24GB+",
                 }),
             }
         }
@@ -150,38 +239,27 @@ class LRW_WanTemporalMetric:
     FUNCTION = "compute"
     CATEGORY = "lrw/wan"
 
-    def compute(
-        self,
-        vae,
-        latent: dict,
-        regularization: float,
-        precision: str,
-        chunk_frames: int,
-    ):
-        from lrw.metric import PullbackMetric
+    def compute(self, vae, latent: dict, regularization: float, precision: str, chunk_frames: int):
+        z_raw = latent["samples"]
+        z, spatial_shape, latent_mode = _extract_spatial_latent(z_raw)
+        D = int(z[0].numel())
 
-        z = latent["samples"]              # (B, C, H, W)
-        B = z.shape[0]
-        spatial_shape = z.shape[1:]        # (C, H, W)
+        metric = _SafeLatentMetric(D=D, regularization=regularization)
 
-        dtype = _safe_dtype(precision)
-
-        decoder = _make_wan_decoder(vae, spatial_shape, dtype)
-
-        metric = PullbackMetric(
-            decoder=decoder,
-            chunk_size=chunk_frames,
-            regularization=regularization,
-        )
-
-        _clear_vram()
-
-        return ({
+        info = {
             "metric": metric,
-            "latent_shape": z.shape,
+            "latent_shape": tuple(z.shape),
+            "spatial_shape": spatial_shape,
+            "D": D,
+            "latent_mode": latent_mode,
             "precision": precision,
-            "chunk_frames": chunk_frames,
-        },)
+            "safe_mode": True,
+            "dense_metric_disabled": True,
+            "note": "No PullbackMetric, no vmap, no dense D x D tensor.",
+        }
+
+        _clear_memory()
+        return (info,)
 
 
 # ─────────────────────────────────────────────
@@ -190,19 +268,20 @@ class LRW_WanTemporalMetric:
 
 class LRW_WanGeodesicKeyframes:
     """
-    Computes Riemannian geodesic keyframes between start and end latents.
+    Computes memory-safe latent geodesic keyframes.
 
-    WAN's default path through latent space is Euclidean (straight line),
-    which causes unnatural motion arcs and flickering. This node computes
-    the true geodesic path and injects intermediate keyframes to guide WAN
-    along a semantically consistent trajectory.
+    Default backend:
+    - lrw_interpolate_try: uses lrw.geodesic.GeodesicSolver.interpolate() first.
+      If LRW tries dense metric operations or fails, it safely falls back to safe_slerp.
 
-    Connect BEFORE WanFirstLastFrameToVideo or WanAdvancedI2V.
+    Optional backend:
+    - safe_slerp: guaranteed O(K*B*D), no D x D matrix, no vmap, no VAE decode.
+    - lerp_debug: linear interpolation for comparison.
 
-    Pipeline:
-        VAEEncode(start) ──> LRW_WanGeodesicKeyframes ──> WanFirstLastFrameToVideo
-        VAEEncode(end)   ──/        + metric            /
-        LRW_WanTemporalMetric ─────/
+    Recommended for 16GB VRAM:
+    - backend: lrw_interpolate_try
+    - vram_mode: low_12gb or mid_16gb
+    - n_keyframes: 2 or 3
     """
 
     @classmethod
@@ -217,14 +296,14 @@ class LRW_WanGeodesicKeyframes:
                     "min": 1,
                     "max": 16,
                     "step": 1,
-                    "tooltip": "Intermediate keyframes between start and end.",
+                    "tooltip": "Number of intermediate keyframes. 2-3 recommended for 16GB VRAM.",
                 }),
                 "n_geodesic_steps": ("INT", {
-                    "default": 10,
+                    "default": 20,
                     "min": 5,
-                    "max": 50,
+                    "max": 100,
                     "step": 1,
-                    "tooltip": "Integration steps. Higher = accurate but slower.",
+                    "tooltip": "Only used when initializing lrw GeodesicSolver. safe_slerp does not need dense integration.",
                 }),
                 "geodesic_step_size": ("FLOAT", {
                     "default": 0.05,
@@ -233,7 +312,17 @@ class LRW_WanGeodesicKeyframes:
                     "step": 0.001,
                 }),
                 "vram_mode": (["auto", "low_12gb", "mid_16gb", "high_24gb"], {
-                    "default": "auto",
+                    "default": "mid_16gb",
+                }),
+                "backend": (["lrw_interpolate_try", "safe_slerp", "lerp_debug"], {
+                    "default": "lrw_interpolate_try",
+                }),
+                "output_dtype": (["same", "fp16", "bf16", "fp32"], {
+                    "default": "same",
+                }),
+                "keyframe_output_layout": (["wan_5d", "image_4d", "same_as_input"], {
+                    "default": "wan_5d",
+                    "tooltip": "Use wan_5d before WAN VAEDecode. This prevents shape[4] IndexError.",
                 }),
             }
         }
@@ -243,15 +332,14 @@ class LRW_WanGeodesicKeyframes:
     FUNCTION = "compute"
     CATEGORY = "lrw/wan"
 
-    def _resolve_chunk(self, vram_mode: str) -> int:
-        if vram_mode == "auto":
-            free = _get_free_vram_gb()
-            if free < 4:
-                return 1
-            elif free < 8:
-                return 2
-            return 4
-        return {"low_12gb": 1, "mid_16gb": 2, "high_24gb": 4}.get(vram_mode, 1)
+    def _cast_output(self, x: Tensor, source: Tensor, output_dtype: str) -> Tensor:
+        if output_dtype == "same":
+            return x.to(dtype=source.dtype)
+        if output_dtype == "fp16":
+            return x.to(dtype=torch.float16)
+        if output_dtype == "bf16":
+            return x.to(dtype=torch.bfloat16)
+        return x.to(dtype=torch.float32)
 
     def compute(
         self,
@@ -262,91 +350,143 @@ class LRW_WanGeodesicKeyframes:
         n_geodesic_steps: int,
         geodesic_step_size: float,
         vram_mode: str,
+        backend: str,
+        output_dtype: str,
+        keyframe_output_layout: str,
     ):
-        from lrw.geodesic import BVPSolver
+        with torch.no_grad():
+            z0_raw = latent_start["samples"]
+            z1_raw = latent_end["samples"]
 
-        chunk = self._resolve_chunk(vram_mode)
+            z0, spatial_shape, mode0 = _extract_spatial_latent(z0_raw)
+            z1, spatial_shape_1, mode1 = _extract_spatial_latent(z1_raw)
 
-        z0 = latent_start["samples"]       # (B, C, H, W)
-        z1 = latent_end["samples"]
+            if tuple(z0.shape) != tuple(z1.shape):
+                raise ValueError(
+                    f"latent_start and latent_end must have the same processed shape. "
+                    f"Got {tuple(z0.shape)} and {tuple(z1.shape)}."
+                )
 
-        B = z0.shape[0]
-        spatial_shape = z0.shape[1:]
-        D = z0[0].numel()
+            B = z0.shape[0]
+            D = int(z0[0].numel())
+            chunk = _resolve_chunk(vram_mode, B)
 
-        # float32 for numerical stability in geodesic computation
-        z0_flat = z0.reshape(B, D).float()
-        z1_flat = z1.reshape(B, D).float()
+            metric_obj = metric.get("metric", _SafeLatentMetric(D=D))
+            lrw_solver, lrw_status = _try_init_lrw_solver(metric_obj, n_geodesic_steps, geodesic_step_size)
 
-        m = metric["metric"]
+            # Intermediate t values only, excluding 0 and 1.
+            t_values = torch.linspace(
+                0.0,
+                1.0,
+                steps=n_keyframes + 2,
+                device=z0.device,
+                dtype=torch.float32,
+            )[1:-1]
 
-        # BVPSolver: finds true geodesic by solving the Boundary Value Problem.
-        # Iteratively refines initial velocity v0 until shoot(z0, v0) ≈ z1.
-        # This guarantees arrival at z1 — unlike GeodesicSolver.interpolate()
-        # which uses Euclidean initial velocity without convergence guarantee.
-        solver = BVPSolver(
-            metric=m,
-            n_steps=n_geodesic_steps,
-            step_size=geodesic_step_size,
-            lr=0.1,
-            max_iter=30,
-            tol=1e-3,
-        )
-
-        # Compute true geodesic path: (n_keyframes+2, B, D)
-        # includes z0 at [0] and z1 at [-1]
-        if chunk == 1:
-            path, bvp_info = solver.geodesic_path(
-                z0_flat, z1_flat, n_points=n_keyframes + 2
+            # Allocate final output once. This prevents repeated stack/cat memory spikes.
+            out = torch.empty(
+                (B * n_keyframes, *spatial_shape),
+                device=z0.device,
+                dtype=torch.float32,
             )
-            converged = bvp_info["converged"]
-            final_error = bvp_info["final_error"]
-        else:
-            path_chunks = []
-            converged = True
-            final_error = 0.0
+
+            used_backend = backend
+            fallback_reason = ""
+
             for b_start in range(0, B, chunk):
                 b_end = min(b_start + chunk, B)
-                path_chunk, bvp_info = solver.geodesic_path(
-                    z0_flat[b_start:b_end],
-                    z1_flat[b_start:b_end],
-                    n_points=n_keyframes + 2,
-                )
-                path_chunks.append(path_chunk)
-                converged = converged and bvp_info["converged"]
-                final_error = max(final_error, bvp_info["final_error"])
-                _clear_vram()
-            path = torch.cat(path_chunks, dim=1)
+                z0_flat = z0[b_start:b_end].reshape(b_end - b_start, D).float()
+                z1_flat = z1[b_start:b_end].reshape(b_end - b_start, D).float()
 
-        # Exclude start (index 0) and end (index -1)
-        keyframes_flat = path[1:-1]  # (n_keyframes, B, D)
+                path_flat = None
 
-        keyframes = []
-        for i in range(n_keyframes):
-            z_t = keyframes_flat[i].reshape(B, *spatial_shape)
-            keyframes.append(z_t)
-            _clear_vram()
+                if backend == "lerp_debug":
+                    path_flat = _latent_lerp_pair(z0_flat, z1_flat, t_values)
 
-        keyframe_tensor = torch.stack(keyframes, dim=1)    # (B, n, C, H, W)
-        keyframe_tensor = keyframe_tensor.reshape(
-            B * n_keyframes, *spatial_shape
-        )
+                elif backend == "lrw_interpolate_try" and lrw_solver is not None:
+                    try:
+                        # Some lrw versions may support interpolate() without dense metric access.
+                        # If it tries metric_tensor(), _SafeLatentMetric raises and we fallback.
+                        full_path = lrw_solver.interpolate(
+                            z0_flat,
+                            z1_flat,
+                            n_points=n_keyframes + 2,
+                        )
+                        path_flat = full_path[1:-1].float()
+                    except Exception as exc:
+                        used_backend = "safe_slerp_fallback"
+                        fallback_reason = f"lrw interpolate failed safely: {type(exc).__name__}: {exc}"
+                        path_flat = _safe_slerp_pair(z0_flat, z1_flat, t_values)
 
-        vram_used = (
-            torch.cuda.memory_allocated() / 1e9
-            if torch.cuda.is_available() else 0.0
-        )
-        info = (
-            f"BVP converged: {converged} | error: {final_error:.4f} | "
-            f"VRAM mode: {vram_mode} | chunk: {chunk} | "
-            f"keyframes: {n_keyframes} | VRAM used: {vram_used:.1f}GB"
-        )
+                else:
+                    path_flat = _safe_slerp_pair(z0_flat, z1_flat, t_values)
 
-        return (
-            {"samples": keyframe_tensor},
-            latent_start,
-            info,
-        )
+                # path_flat: (K, chunk_B, D)
+                for k in range(n_keyframes):
+                    out_index_start = k * B + b_start
+                    out_index_end = k * B + b_end
+                    out[out_index_start:out_index_end] = path_flat[k].reshape(b_end - b_start, *spatial_shape)
+
+                del z0_flat, z1_flat, path_flat
+                _clear_memory()
+
+            out = self._cast_output(out, z0, output_dtype)
+
+            # Force output layout for downstream VAEDecode.
+            # WAN VAE decode expects 5D latent: (B, C, T, H, W).
+            # Since keyframes are stacked as (B*K, C, H, W), add T=1.
+            before_layout_shape = tuple(out.shape)
+            if keyframe_output_layout == "wan_5d":
+                if out.ndim == 4:
+                    out = out.unsqueeze(2)  # (B*K, C, 1, H, W)
+            elif keyframe_output_layout == "image_4d":
+                if out.ndim == 5:
+                    out = out[:, :, 0, :, :]
+            elif keyframe_output_layout == "same_as_input":
+                # If original input was 5D, output 5D; otherwise keep 4D.
+                if z0_raw.ndim == 5 and out.ndim == 4:
+                    out = out.unsqueeze(2)
+            after_layout_shape = tuple(out.shape)
+
+            # Diagnostics
+            z0_diag = z0.reshape(B, D).float()
+            z1_diag = z1.reshape(B, D).float()
+
+            cos_sim = torch.nn.functional.cosine_similarity(z0_diag, z1_diag, dim=-1).mean().item()
+            cos_sim = max(-1.0, min(1.0, cos_sim))
+            angle_deg = math.degrees(math.acos(cos_sim))
+
+            mid_index = max(0, min(n_keyframes - 1, n_keyframes // 2))
+            mid = out[mid_index * B:(mid_index + 1) * B].reshape(B, D).float()
+
+            norm_z0 = z0_diag.norm(dim=-1).mean().item()
+            norm_z1 = z1_diag.norm(dim=-1).mean().item()
+            norm_mid = mid.norm(dim=-1).mean().item()
+            expected_norm_mid = 0.5 * (norm_z0 + norm_z1)
+            norm_ratio = norm_mid / (expected_norm_mid + 1e-8)
+
+            vram_used = torch.cuda.memory_allocated() / 1e9 if torch.cuda.is_available() else 0.0
+            vram_free = _get_free_vram_gb()
+
+            info_lines = [
+                "LRW WAN Safe Latent Geodesic v7",
+                f"backend: {used_backend}",
+                f"lrw status: {lrw_status}",
+                f"fallback: {fallback_reason or 'none'}",
+                f"input modes: start={mode0}, end={mode1}",
+                f"processed latent shape: {tuple(z0.shape)}",
+                f"D: {D} | B: {B} | keyframes: {n_keyframes} | chunk: {chunk}",
+                f"keyframe output layout: {keyframe_output_layout}",
+                f"keyframe shape before layout: {before_layout_shape}",
+                f"keyframe shape after layout: {after_layout_shape}",
+                f"SLERP angle: {angle_deg:.2f} deg",
+                f"mid norm ratio: {norm_ratio:.4f} (near 1.0 means stable norm)",
+                f"dense D x D metric: disabled",
+                f"VRAM allocated: {vram_used:.2f} GB | VRAM free: {vram_free:.2f} GB",
+            ]
+
+            _clear_memory()
+            return ({"samples": out}, latent_start, "\n".join(info_lines))
 
 
 # ─────────────────────────────────────────────
@@ -355,17 +495,10 @@ class LRW_WanGeodesicKeyframes:
 
 class LRW_WanCurvatureGuide:
     """
-    Measures latent manifold curvature along the path from start to end.
+    Lightweight latent-distance guide.
 
-    High curvature = complex transition (WAN needs more guidance).
-    Low curvature = simple transition (fewer keyframes needed).
-
-    Use the output info to decide:
-    - How many keyframes to inject (n_keyframes in LRW_WanGeodesicKeyframes)
-    - Whether to use high-noise or low-noise WAN model variant
-
-    High mean_curvature (>1.0) → use more keyframes + high-noise model
-    Low mean_curvature (<0.5)  → fewer keyframes + low-noise model
+    This node never calls metric_tensor() and never creates D x D matrices.
+    It only computes O(D) cosine/L2 statistics.
     """
 
     @classmethod
@@ -376,9 +509,9 @@ class LRW_WanCurvatureGuide:
                 "latent_end": ("LATENT",),
                 "metric": ("METRIC",),
                 "n_segments": ("INT", {
-                    "default": 8,
+                    "default": 4,
                     "min": 2,
-                    "max": 32,
+                    "max": 16,
                     "step": 1,
                 }),
             }
@@ -389,61 +522,127 @@ class LRW_WanCurvatureGuide:
     FUNCTION = "compute"
     CATEGORY = "lrw/wan"
 
-    def compute(
-        self,
-        latent_start: dict,
-        latent_end: dict,
-        metric: dict,
-        n_segments: int,
-    ):
-        from lrw.utils import riemannian_norm
+    def compute(self, latent_start: dict, latent_end: dict, metric: dict, n_segments: int):
+        with torch.no_grad():
+            z0_raw = latent_start["samples"]
+            z1_raw = latent_end["samples"]
 
-        z0 = latent_start["samples"]
-        z1 = latent_end["samples"]
+            z0, _shape0, mode0 = _extract_spatial_latent(z0_raw)
+            z1, _shape1, mode1 = _extract_spatial_latent(z1_raw)
 
-        B = z0.shape[0]
-        D = z0[0].numel()
+            if tuple(z0.shape) != tuple(z1.shape):
+                raise ValueError(
+                    f"latent_start and latent_end must have same processed shape. "
+                    f"Got {tuple(z0.shape)} and {tuple(z1.shape)}."
+                )
 
-        z0_flat = z0.reshape(B, D).float()
-        z1_flat = z1.reshape(B, D).float()
+            B = z0.shape[0]
+            D = int(z0[0].numel())
 
-        m = metric["metric"]
-        curvatures = []
+            z0_flat = z0.reshape(B, D).float()
+            z1_flat = z1.reshape(B, D).float()
 
-        ts = torch.linspace(0, 1, n_segments)
-        for t in ts:
-            z_t = (1 - t) * z0_flat + t * z1_flat
-            G = m.metric_tensor(z_t)                   # (B, D, D)
-            # Frobenius norm as curvature proxy
-            curv = G.norm(dim=(-2, -1)).mean().item()
-            curvatures.append(curv)
-            del G
-            _clear_vram()
+            diff = (z1_flat - z0_flat).norm(dim=-1).mean().item()
+            z0_norm = z0_flat.norm(dim=-1).mean().item()
+            mean_curv = diff / (z0_norm + 1e-8)
 
-        mean_curv = float(torch.tensor(curvatures).mean().item())
+            cos_sim = torch.nn.functional.cosine_similarity(z0_flat, z1_flat, dim=-1).mean().item()
+            cos_sim = max(-1.0, min(1.0, cos_sim))
+            angle_deg = math.degrees(math.acos(cos_sim))
 
-        # Recommend keyframes based on curvature
-        if mean_curv > 2.0:
-            recommended = 7
-            model_hint = "high-noise model recommended"
-        elif mean_curv > 1.0:
-            recommended = 5
-            model_hint = "high-noise model recommended"
-        elif mean_curv > 0.5:
-            recommended = 3
-            model_hint = "either model works"
-        else:
-            recommended = 1
-            model_hint = "low-noise model recommended"
+            if angle_deg > 60:
+                recommended = 5
+                hint = "Large latent angle. Use 4-5 keyframes if memory allows."
+            elif angle_deg > 30:
+                recommended = 3
+                hint = "Medium latent angle. 3 keyframes recommended."
+            else:
+                recommended = 2
+                hint = "Small latent angle. 2 keyframes should be enough."
 
-        info = "\n".join([
-            f"Mean curvature: {mean_curv:.4f}",
-            f"Recommended keyframes: {recommended}",
-            f"Model hint: {model_hint}",
-            "─" * 30,
-        ] + [
-            f"  t={t:.2f}: curvature={c:.4f}"
-            for t, c in zip(ts.tolist(), curvatures)
-        ])
+            # Clamp recommendation for practical 16GB workflows.
+            recommended = min(recommended, 3)
 
-        return (info, mean_curv, recommended)
+            info = "\n".join([
+                "LRW WAN Curvature Guide v7_safe",
+                f"input modes: start={mode0}, end={mode1}",
+                f"processed D: {D}",
+                f"latent distance normalized: {mean_curv:.4f}",
+                f"SLERP angle: {angle_deg:.2f} deg",
+                f"recommended keyframes: {recommended}",
+                f"hint: {hint}",
+                "dense D x D metric: disabled",
+            ])
+
+            del z0_flat, z1_flat
+            _clear_memory()
+            return (info, float(mean_curv), int(recommended))
+
+
+# ─────────────────────────────────────────────
+# Optional utility node: pick a keyframe from stacked keyframes
+# ─────────────────────────────────────────────
+
+class LRW_LatentKeyframePicker:
+    """
+    Picks one keyframe from LRW_WanGeodesicKeyframes output.
+
+    Input keyframes are stacked as:
+    [k0 batch..., k1 batch..., k2 batch...]
+
+    This utility is intentionally tiny and memory-safe.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "keyframe_latents": ("LATENT",),
+                "batch_size": ("INT", {
+                    "default": 1,
+                    "min": 1,
+                    "max": 64,
+                    "step": 1,
+                }),
+                "keyframe_index": ("INT", {
+                    "default": 0,
+                    "min": 0,
+                    "max": 15,
+                    "step": 1,
+                }),
+            }
+        }
+
+    RETURN_TYPES = ("LATENT",)
+    RETURN_NAMES = ("latent",)
+    FUNCTION = "compute"
+    CATEGORY = "lrw/wan"
+
+    def compute(self, keyframe_latents: dict, batch_size: int, keyframe_index: int):
+        z = keyframe_latents["samples"]
+        total = z.shape[0]
+        if total % batch_size != 0:
+            raise ValueError(f"Total keyframe batch {total} is not divisible by batch_size {batch_size}.")
+        n_keyframes = total // batch_size
+        idx = max(0, min(int(keyframe_index), n_keyframes - 1))
+        picked = z[idx * batch_size:(idx + 1) * batch_size]
+        return ({"samples": picked},)
+
+
+# ─────────────────────────────────────────────
+# ComfyUI registration
+# ─────────────────────────────────────────────
+
+NODE_CLASS_MAPPINGS = {
+    "LRW_WanTemporalMetric": LRW_WanTemporalMetric,
+    "LRW_WanGeodesicKeyframes": LRW_WanGeodesicKeyframes,
+    "LRW_WanCurvatureGuide": LRW_WanCurvatureGuide,
+    "LRW_LatentKeyframePicker": LRW_LatentKeyframePicker,
+}
+
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "LRW_WanTemporalMetric": "LRW WAN Temporal Metric (LRW WAN5D Safe v8)",
+    "LRW_WanGeodesicKeyframes": "LRW WAN Geodesic Keyframes (LRW First WAN5D Safe v8)",
+    "LRW_WanCurvatureGuide": "LRW WAN Curvature Guide (WAN5D Safe v8)",
+    "LRW_LatentKeyframePicker": "LRW Latent Keyframe Picker",
+}
