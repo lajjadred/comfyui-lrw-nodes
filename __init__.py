@@ -18,13 +18,17 @@ from .nodes.wan_nodes import (
     LRW_WanGeodesicKeyframes,
     LRW_WanTemporalMetric,
     LRW_WanCurvatureGuide,
+    LRW_LatentKeyframePicker,
 )
+from .nodes.lrw_wan_latent_guide_blend import LRW_WanLatentGuideBlend
 
 NODE_CLASS_MAPPINGS = {
     # WAN2.2 전용 노드 (핵심)
     "LRW_WanGeodesicKeyframes": LRW_WanGeodesicKeyframes,
     "LRW_WanTemporalMetric": LRW_WanTemporalMetric,
     "LRW_WanCurvatureGuide": LRW_WanCurvatureGuide,
+    "LRW_LatentKeyframePicker": LRW_LatentKeyframePicker,
+    "LRW_WanLatentGuideBlend": LRW_WanLatentGuideBlend,
     # Core bridge nodes
     "LRW_VAEDecoderBridge": LRW_VAEDecoderBridge,
     "LRW_LatentBlend": LRW_LatentBlend,
@@ -45,9 +49,11 @@ NODE_CLASS_MAPPINGS = {
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     # WAN2.2 전용 노드
-    "LRW_WanGeodesicKeyframes": "WAN Geodesic Keyframes (LRW)",
-    "LRW_WanTemporalMetric": "WAN Temporal Metric (LRW)",
-    "LRW_WanCurvatureGuide": "WAN Curvature Guide (LRW)",
+    "LRW_WanGeodesicKeyframes": "WAN Geodesic Keyframes (LRW v7)",
+    "LRW_WanTemporalMetric": "WAN Temporal Metric (LRW v7)",
+    "LRW_WanCurvatureGuide": "WAN Curvature Guide (LRW v7)",
+    "LRW_LatentKeyframePicker": "LRW Latent Keyframe Picker",
+    "LRW_WanLatentGuideBlend": "LRW WAN Latent Guide Blend",
     # Core bridge nodes
     "LRW_VAEDecoderBridge": "VAE Decoder Bridge (LRW)",
     "LRW_LatentBlend": "Latent Blend / Frame Select (LRW)",
