@@ -31,7 +31,7 @@ The right-side result uses LRW geodesic keyframes as a latent guide before KSamp
 
 #### 4-step comparison
 
-[Watch 4-step comparison](examples/media/output_compare_side_by_side.mp4)
+https://github.com/user-attachments/assets/07416cb8-5d9d-4c26-b306-48ea34323533
 
 ```text
 KSampler steps: 4
@@ -41,7 +41,7 @@ Right: LRW-guided latent blend
 
 #### 6-step comparison
 
-[Watch 6-step comparison](examples/media/output_compare_side_by_side01.mp4)
+https://github.com/user-attachments/assets/43b13522-367e-4974-8920-d5dbab3dc597
 
 ```text
 KSampler steps: 6
