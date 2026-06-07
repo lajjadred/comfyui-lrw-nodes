@@ -1,13 +1,31 @@
 [project]
 name = "comfyui-lrw-nodes"
-version = "0.1.0"
-description = "ComfyUI custom nodes for Riemannian geometry and Bayesian latent space manipulation"
+version = "0.3.0"
+description = "ComfyUI custom nodes for latent-space geometry, geodesic interpolation, and WAN2.2 video guidance"
 readme = "README.md"
 license = { text = "BSL-1.1" }
 requires-python = ">=3.12"
 authors = [{ name = "lajjadred" }]
-keywords = ["comfyui", "riemannian-geometry", "latent-space", "diffusion-models"]
+keywords = [
+    "comfyui",
+    "riemannian-geometry",
+    "latent-space",
+    "geodesic",
+    "wan2.2",
+    "diffusion-models",
+    "video-generation",
+    "parallel-transport",
+]
+
+[project.dependencies]
+latent-riemannian-world = ">=0.3.0"
+torch = ">=2.4"
 
 [project.urls]
 Homepage = "https://github.com/lajjadred/comfyui-lrw-nodes"
 Repository = "https://github.com/lajjadred/comfyui-lrw-nodes"
+
+[tool.comfy]
+PublisherId = "lajjadred"
+DisplayName = "comfyui-lrw-nodes"
+Icon = ""
