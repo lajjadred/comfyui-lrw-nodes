@@ -580,56 +580,6 @@ class LRW_WanCurvatureGuide:
 
 
 # ─────────────────────────────────────────────
-# Optional utility node: pick a keyframe from stacked keyframes
-# ─────────────────────────────────────────────
-
-class LRW_LatentKeyframePicker:
-    """
-    Picks one keyframe from LRW_WanGeodesicKeyframes output.
-
-    Input keyframes are stacked as:
-    [k0 batch..., k1 batch..., k2 batch...]
-
-    This utility is intentionally tiny and memory-safe.
-    """
-
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "keyframe_latents": ("LATENT",),
-                "batch_size": ("INT", {
-                    "default": 1,
-                    "min": 1,
-                    "max": 64,
-                    "step": 1,
-                }),
-                "keyframe_index": ("INT", {
-                    "default": 0,
-                    "min": 0,
-                    "max": 15,
-                    "step": 1,
-                }),
-            }
-        }
-
-    RETURN_TYPES = ("LATENT",)
-    RETURN_NAMES = ("latent",)
-    FUNCTION = "compute"
-    CATEGORY = "lrw/wan"
-
-    def compute(self, keyframe_latents: dict, batch_size: int, keyframe_index: int):
-        z = keyframe_latents["samples"]
-        total = z.shape[0]
-        if total % batch_size != 0:
-            raise ValueError(f"Total keyframe batch {total} is not divisible by batch_size {batch_size}.")
-        n_keyframes = total // batch_size
-        idx = max(0, min(int(keyframe_index), n_keyframes - 1))
-        picked = z[idx * batch_size:(idx + 1) * batch_size]
-        return ({"samples": picked},)
-
-
-# ─────────────────────────────────────────────
 # ComfyUI registration
 # ─────────────────────────────────────────────
 
@@ -637,12 +587,10 @@ NODE_CLASS_MAPPINGS = {
     "LRW_WanTemporalMetric": LRW_WanTemporalMetric,
     "LRW_WanGeodesicKeyframes": LRW_WanGeodesicKeyframes,
     "LRW_WanCurvatureGuide": LRW_WanCurvatureGuide,
-    "LRW_LatentKeyframePicker": LRW_LatentKeyframePicker,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "LRW_WanTemporalMetric": "LRW WAN Temporal Metric (LRW WAN5D Safe v8)",
     "LRW_WanGeodesicKeyframes": "LRW WAN Geodesic Keyframes (LRW First WAN5D Safe v8)",
     "LRW_WanCurvatureGuide": "LRW WAN Curvature Guide (WAN5D Safe v8)",
-    "LRW_LatentKeyframePicker": "LRW Latent Keyframe Picker",
 }
